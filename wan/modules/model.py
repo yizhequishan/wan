@@ -127,7 +127,17 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(
+        self,
+        x,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        *,
+        layer_idx=None,
+        analysis_ctx=None,
+        analysis_sidecar=None,
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -146,12 +156,35 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        q_rope = rope_apply(q, grid_sizes, freqs)
+        k_rope = rope_apply(k, grid_sizes, freqs)
+
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+            q=q_rope,
+            k=k_rope,
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
+
+        # Run the observer only after the original dense output is complete.
+        # This branch cannot replace or modify q/k/v/x.
+        if analysis_sidecar is not None and layer_idx is None:
+            raise ValueError("layer_idx is required by analysis_sidecar")
+        should_observe = analysis_sidecar is not None
+        if should_observe and hasattr(analysis_sidecar, 'should_observe'):
+            should_observe = analysis_sidecar.should_observe(
+                layer_idx=layer_idx, context=analysis_ctx)
+        if should_observe:
+            half_dtypes = (torch.float16, torch.bfloat16)
+            analysis_dtype = (
+                v.dtype if v.dtype in half_dtypes else torch.bfloat16)
+            analysis_sidecar.observe(
+                q=q_rope.detach().to(analysis_dtype),
+                k=k_rope.detach().to(analysis_dtype),
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                layer_idx=layer_idx,
+                context=analysis_ctx)
 
         # output
         x = x.flatten(2)
@@ -284,6 +317,9 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        layer_idx=None,
+        analysis_ctx=None,
+        analysis_sidecar=None,
     ):
         r"""
         Args:
@@ -299,9 +335,21 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+        self_attn_input = self.norm1(x).float() * (1 + e[1]) + e[0]
+        if analysis_sidecar is None:
+            # Preserve the original positional call, including compatibility
+            # with the optional USP monkey-patched attention implementation.
+            y = self.self_attn(
+                self_attn_input, seq_lens, grid_sizes, freqs)
+        else:
+            y = self.self_attn(
+                self_attn_input,
+                seq_lens,
+                grid_sizes,
+                freqs,
+                layer_idx=layer_idx,
+                analysis_ctx=analysis_ctx,
+                analysis_sidecar=analysis_sidecar)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -487,6 +535,10 @@ class WanModel(ModelMixin, ConfigMixin):
         if model_type == 'i2v' or model_type == 'flf2v':
             self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == 'flf2v')
 
+        # Plain Python observer; intentionally not an nn.Module and therefore
+        # absent from checkpoints/state_dict.
+        self.analysis_sidecar = None
+
         # initialize weights
         self.init_weights()
 
@@ -498,6 +550,7 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        analysis_ctx=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -515,6 +568,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            analysis_ctx (Mapping, *optional*):
+                Read-only metadata passed to an attached attention sidecar.
 
         Returns:
             List[Tensor]:
@@ -571,8 +626,13 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        for layer_idx, block in enumerate(self.blocks):
+            x = block(
+                x,
+                **kwargs,
+                layer_idx=layer_idx,
+                analysis_ctx=analysis_ctx,
+                analysis_sidecar=self.analysis_sidecar)
 
         # head
         x = self.head(x, e)

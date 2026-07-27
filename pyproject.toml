@@ -40,6 +40,11 @@ dev = [
     "mypy",
     "huggingface-hub[cli]"
 ]
+analysis = [
+    "flash-kmeans==0.2.0",
+    "PyYAML>=6.0",
+    "scipy>=1.10"
+]
 
 [project.urls]
 homepage = "https://wanxai.com"

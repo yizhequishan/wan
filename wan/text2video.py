@@ -121,7 +121,8 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 analysis_video_id=None):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -146,6 +147,8 @@ class WanT2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            analysis_video_id (`str`, *optional*):
+                Stable ID used by an attached read-only attention sidecar.
 
         Returns:
             torch.Tensor:
@@ -170,6 +173,16 @@ class WanT2V:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+        analysis_sidecar = getattr(self.model, 'analysis_sidecar', None)
+        if analysis_sidecar is None and hasattr(self.model, 'module'):
+            analysis_sidecar = getattr(
+                self.model.module, 'analysis_sidecar', None)
+        if analysis_sidecar is not None and self.sp_size != 1:
+            raise NotImplementedError(
+                "Attention sidecars currently require single-GPU attention.")
+        analysis_video_id = (
+            str(analysis_video_id)
+            if analysis_video_id is not None else f"seed_{seed}")
 
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
@@ -230,17 +243,42 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for step_index, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                if analysis_sidecar is None:
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+                else:
+                    timestep_value = float(t.detach().cpu().item())
+                    common_ctx = {
+                        'video_id': analysis_video_id,
+                        'step_index': step_index,
+                        'timestep': timestep_value,
+                        'analysis_seed': seed,
+                    }
+                    noise_pred_cond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        analysis_ctx={
+                            **common_ctx,
+                            'branch': 'cond',
+                        },
+                        **arg_c)[0]
+                    noise_pred_uncond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        analysis_ctx={
+                            **common_ctx,
+                            'branch': 'uncond',
+                        },
+                        **arg_null)[0]
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
@@ -254,6 +292,8 @@ class WanT2V:
                 latents = [temp_x0.squeeze(0)]
 
             x0 = latents
+            if analysis_sidecar is not None:
+                analysis_sidecar.finish_video(analysis_video_id)
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
