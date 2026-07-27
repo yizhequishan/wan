@@ -1,0 +1,23 @@
+enabled: true
+observe_branch: cond
+
+layers: [0, 6, 12, 17, 23, 29]
+record_steps: [0, 5, 10, 20, 35, 49]
+update_cache_every_step: true
+
+cq: 256
+ck: 1024
+kmeans_init_iters: 50
+kmeans_cached_iters: 2
+kmeans_tol: 0.0001
+
+visualization_ids: [kubric_000, kubric_001]
+save_full_labels: visualization_only
+save_centroids_for_visualizations: true
+save_cross_frame_graph: true
+compute_hungarian: true
+
+expected_videos: 20
+score_chunk_q: 32
+seed: 20260727
+output_dir: results/svg2_pilot_c256_k1024

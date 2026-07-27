@@ -1,0 +1,6 @@
+# SVG2's official standalone K-means implementation.
+flash-kmeans==0.2.0
+
+# Pilot configuration and Hungarian centroid matching.
+PyYAML>=6.0
+scipy>=1.10
